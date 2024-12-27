@@ -6,8 +6,8 @@ import subprocess
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 
-from scipy.stats import scoreatpercentile as score, t
-from numpy import mean, median, std, arange, isnan, log10, quantile, sqrt, linspace, var
+from scipy.stats import scoreatpercentile as score, t, bootstrap
+from numpy import mean, median, std, arange, isnan, log10, quantile, sqrt, linspace, var, random
 
 def get_tick_font_size_30():
     return 7
@@ -114,6 +114,99 @@ def draw_cdf_range(db, bytes, axis, color="C0", linestyle="-", label_prefix=""):
         [score(range_data[i], 75) for i in y],
         label=f"{label_prefix}[P25,P75]", color=color, alpha=0.5, linestyle=linestyle)
     axis.plot([score(range_data[i], 50) for i in y], y, label=f"{label_prefix}P50", color=color, linestyle=linestyle)
+
+def bootstrap_wrap(vals1, vals2, confidence, rng=None):
+    def ratio_cb(vals1, vals2, axis=-1):
+        mean1 = mean(vals1, axis=axis)
+        mean2 = mean(vals2, axis=axis)
+        return mean2/mean1
+    data = (vals1, vals2)
+    res = bootstrap(data, ratio_cb, n_resamples=20000, confidence_level=confidence, random_state=rng, method='percentile')
+    return ratio_cb(vals1, vals2), res.confidence_interval.low, res.confidence_interval.high
+
+def draw_ratio_ci(db1, db2, bytes, axis, levels=[2], colors=["C0"], confidence=0.95, linestyle="-", label_prefix=""):
+    def get_quantile_buckets(quantiles_to_plot, db):
+        quantile_buckets = {q:[] for q in quantiles_to_plot}
+
+        # we should have one empirical value for each simulation for each quantile
+        for sim in sorted(db1.keys())[0:level]:
+            dl_times = db[sim][bytes] if bytes != None else db[sim]
+            dl_times.sort(key=getfirstorself)
+            num_times = len(dl_times)
+            if num_times == 0:
+                continue
+            for q in quantile_buckets:
+                val_at_q = dl_times[int((num_times-1) * q)]
+                quantile_buckets[q].append(val_at_q)
+        return quantile_buckets
+
+    quantiles_to_plot = list(linspace(0, 0.99, num=1000))
+    rng = random.default_rng()
+
+    for l, level in enumerate(sorted(levels)):
+        quantile_buckets1 = get_quantile_buckets(quantiles_to_plot, db1)
+        if len(quantile_buckets1[0]) < level:
+            level = len(quantile_buckets1[0])
+        quantile_buckets2 = get_quantile_buckets(quantiles_to_plot, db2)
+        if len(quantile_buckets1[0]) < level:
+            level = len(quantile_buckets2[0])
+
+        #z = get_err_factor(level, confidence)
+        x, x_left, x_right = [], [], []
+        for i, q in enumerate(quantiles_to_plot):
+            bucket1 = quantile_buckets1[q]
+            bucket2 = quantile_buckets2[q]
+
+            # bucket will be a list of items, each of which will either
+            # be the value (a number), or a list of two numbers (the
+            # value and the resolution).  If it's just a value, the
+            # correspinding resolution is 0.  Create the list of values
+            # and the list of resolutions.
+            emp_sample1 = [getfirstorself(item) for item in bucket1]
+            emp_sample2 = [getfirstorself(item) for item in bucket2]
+            #resolutions = [getsecondorzero(item) for item in bucket]
+
+            # The resolution variance is 1/12 of the sum of the squares
+            # of the resolutions
+            #resolution_variance = sum([res**2 for res in resolutions])/12
+
+            #k, m, v = len(emp_sample), mean(emp_sample), var(emp_sample)
+            #s = sqrt(v + resolution_variance/k)
+            #assert k == level
+
+            #x_left_val = m-z*s
+            #x_right_val = m+z*s
+
+            m, low, high = bootstrap_wrap(emp_sample1, emp_sample2, confidence, rng=rng)
+            x.append(m)
+            x_left.append(low)
+            x_right.append(high)
+
+        # for debugging
+        #axis.plot(x_left, y, label=f"level={level}", color=colors[l%len(colors)], linestyle=linestyle)
+        #axis.plot(x_right, y, label=f"level={level}", color=colors[l%len(colors)], linestyle=linestyle)
+
+        color_spec = colors[l%len(colors)]
+
+        if len(levels) == 1:
+            alpha_spec = 0.5
+        else:
+            alpha_spec = 0.6/len(levels)*(l+1)
+
+        label_suffix = f"{level}"
+        if level == 97 or level == 99: # 100% error rate fixup
+            label_suffix = "100"
+
+        y = quantiles_to_plot
+        #y = [1-q for q in quantiles_to_plot] #ccdf
+        if l == len(levels)-1:
+            axis.plot(x, y, linestyle=linestyle, color=color_spec)
+        axis.fill_betweenx(y, x_left, x_right,
+            #step='mid',
+            label=f"{label_prefix}$n$={label_suffix}",
+            color=color_spec,
+            alpha=alpha_spec,
+            linestyle='-')
 
 def get_err_factor(k, confidence):
     return t.ppf(confidence/2 + 0.5, k-1)/sqrt(k-1)
